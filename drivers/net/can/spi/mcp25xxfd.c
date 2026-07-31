@@ -1667,11 +1667,22 @@ static int mcp25xxfd_gpio_setup(struct spi_device *spi)
 	return devm_gpiochip_add_data(&spi->dev, &priv->gpio, priv);
 }
 
+static void mcp25xxfd_gpio_remove(struct spi_device *spi)
+{
+	struct mcp25xxfd_priv *priv = spi_get_drvdata(spi);
+
+	devm_gpiochip_remove(&spi->dev, &priv->gpio);
+}
+
 #else
 
 static int mcp25xxfd_gpio_setup(struct spi_device *spi)
 {
 	return 0;
+}
+
+static void mcp25xxfd_gpio_remove(struct spi_device *spi)
+{
 }
 
 #endif
@@ -3951,6 +3962,10 @@ static const struct of_device_id mcp25xxfd_of_match[] = {
 		.compatible	= "microchip,mcp2517fd",
 		.data		= (void *)CAN_MCP2517FD,
 	},
+	{
+		.compatible	= "commaai,ultimate-can",
+		.data		= (void *)CAN_MCP2517FD,
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, mcp25xxfd_of_match);
@@ -4300,11 +4315,6 @@ static int mcp25xxfd_can_probe(struct spi_device *spi)
 	if (ret)
 		goto out_free;
 
-	/* Setup GPIO controller */
-	ret = mcp25xxfd_gpio_setup(spi);
-	if (ret)
-		goto out_clk;
-
 	/* all by default as push/pull */
 	priv->config.gpio_opendrain = false;
 
@@ -4326,7 +4336,7 @@ static int mcp25xxfd_can_probe(struct spi_device *spi)
 	/* check in device tree for overrrides */
 	ret = mcp25xxfd_of_parse(priv);
 	if (ret)
-		return ret;
+		goto out_clk;
 
 	/* decide on real can clock rate */
 	priv->can.clock.freq = freq;
@@ -4337,7 +4347,8 @@ static int mcp25xxfd_can_probe(struct spi_device *spi)
 				"PLL clock frequency %i would exceed limit\n",
 				priv->can.clock.freq
 				);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out_clk;
 		}
 	}
 	if (priv->config.clock_div2)
@@ -4390,11 +4401,19 @@ static int mcp25xxfd_can_probe(struct spi_device *spi)
 	}
 	if (ret) {
 		if (ret == -ENODEV)
-			dev_err(&spi->dev,
-				"Cannot initialize MCP%x. Wrong wiring?\n",
-				priv->model);
-		//goto error_probe;
+			dev_dbg(&spi->dev, "MCP%x not detected\n", priv->model);
+		goto error_probe;
 	}
+
+	/*
+	 * Register the GPIO controller only after confirming that this is an
+	 * MCP25xxFD.  The ultimate provisioning DT node is also matched by the
+	 * TCAN driver, so a rejected MCP probe must not leave managed resources
+	 * referring to the CAN netdevice that is about to be freed.
+	 */
+	ret = mcp25xxfd_gpio_setup(spi);
+	if (ret)
+		goto error_probe;
 
 	/* setting up GPIO+INT as PUSHPULL , TXCAN PUSH/PULL, no Standby */
 	priv->regs.iocon = 0;
@@ -4410,14 +4429,14 @@ static int mcp25xxfd_can_probe(struct spi_device *spi)
 	ret = mcp25xxfd_cmd_write(spi, MCP25XXFD_IOCON, priv->regs.iocon,
 				  priv->spi_setup_speed_hz);
 	if (ret)
-		return ret;
+		goto error_gpio;
 
 	/* and put controller to sleep */
 	mcp25xxfd_hw_sleep(spi);
 
 	ret = register_candev(net);
 	if (ret)
-		goto error_probe;
+		goto error_gpio;
 
 	/* register debugfs */
 	mcp25xxfd_debugfs_add(priv);
@@ -4427,6 +4446,9 @@ static int mcp25xxfd_can_probe(struct spi_device *spi)
 	netdev_info(net, "MCP%x successfully initialized.\n", priv->model);
 	return 0;
 
+error_gpio:
+	mcp25xxfd_gpio_remove(spi);
+
 error_probe:
 	mcp25xxfd_power_enable(priv->power, 0);
 
@@ -4435,7 +4457,8 @@ out_clk:
 
 out_free:
 	free_candev(net);
-	dev_err(&spi->dev, "Probe failed, err=%d\n", -ret);
+	if (ret != -ENODEV)
+		dev_err(&spi->dev, "Probe failed, err=%d\n", ret);
 	return ret;
 }
 
